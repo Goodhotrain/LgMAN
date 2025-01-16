@@ -1,6 +1,6 @@
 import torch.nn as nn
 from models.ctmmfn2 import Cformer
-from ghy.model import load_visual_pretrained, load_align_pretrained
+from tools.model import load_visual_pretrained, load_align_pretrained
 
 def generate_model(opt, k_fold:int):
     model = Cformer(

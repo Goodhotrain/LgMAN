@@ -1,166 +1,3 @@
-# DEQ-fusion
-import torch
-import torch.nn as nn
-import torchvision
-from models.vit import TimeSformer
-from models.at2 import AudioTransformer
-from models.CModalT import CVAFM, classif_head
-from models.text_encoder import TextEncoder
-from models.blip2qformer import BertAttention, BertLayer, MMCrossAttention
-from transformers import BertTokenizer, BertConfig
-import re
-import random
-from models.mbt_fusion import MBT
-from models.Align import MultimodalAlignNet, ContrastiveAligner
-from ghy.model import freeze
-from einops import rearrange
-
-
-def pre_caption(caption, max_words):
-    caption = re.sub(
-        r"([,.'!?\"()*#:;~])",
-        '',
-        caption.lower(),
-    ).replace('-', ' ').replace('/', ' ').replace('<person>', 'person')
-
-    caption = re.sub(
-        r"\s{2,}",
-        ' ',
-        caption,
-    )
-    caption = caption.rstrip('\n') 
-    caption = caption.strip(' ')
-
-    #truncate caption
-    caption_words = caption.split(' ')
-    if len(caption_words)>max_words:
-        caption = ' '.join(caption_words[:max_words])
-            
-    return caption
-
-class Cformer(nn.Module):
-    def __init__(self,
-                 num_frames=8,
-                 sample_size=224,
-                 n_classes=8,
-                 need_audio=False,
-                 need_text=False,
-                 audio_embed_size=256,
-                 audio_n_segments=8,
-                 text_embed_size=768,):
-        super(Cformer, self).__init__()
-
-        self.need_audio = need_audio
-        self.need_text = need_text
-        self.audio_n_segments = audio_n_segments
-        self.audio_embed_size = audio_embed_size
-        self.num_frames = num_frames
-        self.n_classes = n_classes
-        # self.model = DEQFusion(self.visual_embed_size, 2)
-        # Vision TimeSformer
-        model_file = '/media/Harddisk/ghy/models/TimeSformer_divST_8x32_224_K600.pyth'
-        self.tsformer = TimeSformer(img_size=sample_size, num_classes=600, num_frames=num_frames, attention_type='divided_space_time', pretrained_model = model_file)
-        self.visual_embed_size = self.tsformer.model.embed_dim
-        # Text
-        if need_text:
-            self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-            self.textencoder = TextEncoder()
-        # Audio
-        self.auformer = AudioTransformer(audio_n_segments, segment_len=audio_embed_size, num_classes=n_classes, embed_dim=768, depth=2)
-        self.h = nn.Linear(self.visual_embed_size, self.visual_embed_size)
-        self.model = MBT(2, 8, n_classes, 768)
-        # Multi-modal Alignment Network
-        # self.align_net = MultimodalAlignNet(self.visual_embed_size, text_embed_size, self.visual_embed_size, aligned_dim=768)
-        # self.align_net = ContrastiveAligner(self.visual_embed_size, text_embed_size, aligned_dim=768)
-        self.cross = MMCrossAttention(layer_num=1)
-        self.n = torch.nn.Sigmoid()
-        # self.head2 = classif_head(self.visual_embed_size*2, n_classes, drop=0.5)
-        # self.head2 = nn.Linear(self.visual_embed_size, n_classes)
-        self.head2 = classif_head(self.visual_embed_size, n_classes, drop=0.5)
-        # self.head = nn.Linear(self.visual_embed_size, n_classes)
-        # freeze(self.head2)
-
-    def forward(self, visual: torch.Tensor, audio: list, text: list):
-        b = visual.shape[0]
-        # Feature extraction
-        # Visual Feature
-        with torch.no_grad():
-            x = rearrange(visual, 'b c t h w -> (b t) c h w',b=b,t=8).contiguous()
-            visual = visual.contiguous()
-            F_V, fv,ffv = self.tsformer(visual, x)
-            # print(F_V.shape)
-            V_tf = self.h(ffv)
-            visual_embedded = rearrange(V_tf, '(b t) c -> b t c',b=b,t=8)
-        # visual_embedded = rearrange(V_tf, '(b t) c -> b t c',b=b,t=8)
-        if self.need_audio:
-            # Audio Feature
-            # [B x 8 x 256 x 32]
-            a_f = []
-            # a_ft = []
-            # output = []
-            o = []
-            fixed_length = 1000
-            for num,(t,a_p) in enumerate(zip(text,audio)):
-                # with torch.no_grad():
-                a_F = self.auformer(a_p)  # [B x 256]
-                input_ids, attention_mask = self.text2tensor(t)
-                F_T = self.textencoder(input_ids)
-                # if a_F.shape[0] > fixed_length:
-                #     a_F = a_F[:fixed_length]
-                with torch.no_grad():
-                    o_i = self.cross(F_T, t_encoder_hidden_states = a_F.unsqueeze(0),a_encoder_hidden_states=visual_embedded[num].unsqueeze(0))
-                # o_i = self.cross(visual_embedded[num].unsqueeze(0), t_encoder_hidden_states = F_T)
-                o.append(o_i.squeeze(0)[0,:])
-
-                # output = self.model(F_V,F_A.unsqueeze(1))
-                    # a_F = self.auformepr(a_, MFCC = False)  # [B x 256]
-                # torch.cuda.empty_cache()
-                a_f.append(a_F)
-            F_A = torch.stack(a_f, dim=0)
-            out_align = torch.stack(o, dim=0)
-
-            # with torch.no_grad():
-            output = self.model(fv, F_A.unsqueeze(1))      
-            # output = torch.stack(output, dim=0)
-            # Text Feature
-            # with torch.no_grad():
-            #     output = self.model(fv, F_A.unsqueeze(1))
-            #     output = torch.cat([F_V, output], dim=1)
-                # output = self.head2(out_align) + 0.8 * self.head(output)
-            # output = self.head2(output)
-            # output = torch.max(self.n(output), self.n(self.head(out_align)))
-            # output = (0.8*self.n(output) + 0.2*self.n(self.head(out_align)))
-            # output = self.head(out_align)
-            output = (0.5*output + 0.5*self.head2(out_align))
-            # output = self.head2(out_align)
-        return output
-
-    def text2tensor(self, text:str):
-        text = pre_caption(text, 20)
-        # Encode the text
-        encoded_input = self.tokenizer(text, return_tensors="pt")
-        input_ids = encoded_input["input_ids"].cuda()
-        attention_mask = encoded_input["attention_mask"].cuda()
-
-        tokenized_text = self.tokenizer.tokenize(text)
-        masked_index = random.randint(0, len(tokenized_text) - 1)
-        true_label = tokenized_text[masked_index]
-        tokenized_text[masked_index] = 'MASK'
-        masked_text = ' '.join(tokenized_text)
-
-        # Encode the masked text]
-        encoded_masked_input = self.tokenizer(masked_text, return_tensors="pt")
-        masked_input_ids = encoded_masked_input["input_ids"]
-        masked_attention_mask = encoded_masked_input["attention_mask"]
-        # Create labels tensor
-        true_label_id = self.tokenizer.convert_tokens_to_ids([true_label])[0]
-        m,n = masked_input_ids.shape
-        labels = torch.full((m,n+2), -100)  # Initialize with -100 to ignore all tokens except masked
-        labels[0, masked_index+2] = true_label_id # Set true label for the masked token
-
-        # return input_ids, attention_mask, masked_input_ids.cuda(), masked_attention_mask.cuda(), labels.cuda()
-        return input_ids, attention_mask
-
 from core.loss import get_loss
 from core.optimizer import get_optim
 from core.utils import local2global_path, get_spatial_transform
@@ -169,6 +6,7 @@ from datasets.dataset import get_training_set, get_validation_set, get_test_set,
 from transforms.temporal import TSN
 from transforms.audio import TSNAudio
 from transforms.target import ClassLabel
+from models.lgman import LgMAN
 import datetime
 current_time = datetime.datetime.now()
 print("Time:", current_time)
@@ -176,15 +14,14 @@ print("Notion: ")
 from common.k_fold import read_csv
 from train import train_epoch
 from validation import val_epoch
-from ghy.model import load_visual_pretrained, load_align_pretrained
+from tools.model import load_visual_pretrained, load_align_pretrained
 import torch
 from tensorboardX import SummaryWriter
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 def generate_model(opt, k_fold:int):
-    model = Cformer(
+    model = LgMAN(
         num_frames=opt.n_frames,
         sample_size=opt.sample_size,
         n_classes=opt.n_classes,
@@ -194,14 +31,6 @@ def generate_model(opt, k_fold:int):
         need_text=opt.need_text,
     )
     assert opt.mode in ['pretrain', 'main'], 'mode should be pretrain or main'
-    # if opt.mode == 'pretrain' and opt.visual_pretrained:
-    #    load_visual_pretrained(model, opt.visual_pretrained)
-    # # load_visual_pretrained(model, opt.visual_pretrained)
-    
-    # load_align_pretrained(model, k_fold, model_file='/media/Harddisk/ghy/Mycode_e8/results/debug2/result_20240428_210721/checkpoints/1_40model_state.pth')
-    load_align_pretrained(model, model_file='/media/Harddisk/ghy/C/MTSVRC/results/main/result_20240912_190503/checkpoints/1_30model_state.pth')
-    # load_align_pretrained(model, model_file='/media/HardDisk/ghy/Mycode_e8/results/debug2/result_20240712_194651/checkpoints/1_20model_state.pth')
-    # load_visual_pretrained(model, opt.visual_pretrained)
     model = model.cuda()
     return model, model.parameters()
 
@@ -239,7 +68,7 @@ def parse_opts():
         ],
         'paths': [
             dict(name='--root_path',
-                 default="/media/Harddisk/ghy/C/MTSVRC",
+                 default="",
                  type=str,
                  help='Global path of root directory'),
             dict(name='--result_paths',
@@ -247,19 +76,19 @@ def parse_opts():
                  type=str,
                  help='local path of results directory'),                 
             dict(name="--video_path",
-                 default="/media/Harddisk/Datasets/Micro_Video/MeiTu/video/",
+                 default="MeiTu/video/",
                  type=str,
                  help='Global path of videos', ),
             dict(name="--audio_path",
-                 default="/media/Harddisk/Datasets/Micro_Video/MeiTu/audio/",
+                 default="MeiTu/audio/",
                  type=str,
                  help='Global path of audios', ),
             dict(name="--text_path",
-                 default='/media/Harddisk/ghy/C/MTSVRC/preprocess/mtsvrc_title.json',                                                                
+                 default='mtsvrc_title.json',                                                                
                  type=str,
                  help='Global path of title json file'),
             dict(name="--annotation_path",
-                 default='/media/Harddisk/ghy/C/MTSVRC/preprocess/mtsvrc_title.json',
+                 default='mtsvrc_title.json',
                  type=str,
                  help='Global path of annotation file'),
             dict(name="--result_path",
